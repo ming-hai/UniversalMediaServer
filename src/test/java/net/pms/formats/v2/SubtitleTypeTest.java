@@ -36,6 +36,7 @@ public class SubtitleTypeTest {
 		assertThat(valueOfFileExtension("ass")).isEqualTo(ASS);
 		assertThat(valueOfFileExtension("idx")).isEqualTo(VOBSUB);
 		assertThat(valueOfFileExtension("vtt")).isEqualTo(WEBVTT);
+		assertThat(valueOfFileExtension("sup")).isEqualTo(PGS);
 	}
 
 	@Test
@@ -62,6 +63,8 @@ public class SubtitleTypeTest {
 		assertThat(valueOfLibMediaInfoCodec("S_HDMV/PGS")).isEqualTo(PGS);
 		assertThat(valueOfLibMediaInfoCodec("144")).isEqualTo(PGS);
 		assertThat(valueOfLibMediaInfoCodec("WebVTT")).isEqualTo(WEBVTT);
+		assertThat(valueOfLibMediaInfoCodec("S_HDMV/TEXTST")).isEqualTo(TEXTST);
+		assertThat(valueOfLibMediaInfoCodec("S_DVBSUB")).isEqualTo(DVBSUB);
 	}
 
 	@Test
@@ -69,16 +72,19 @@ public class SubtitleTypeTest {
 		assertThat(UNKNOWN.getDescription()).isEqualTo("Generic");
 		assertThat(UNSUPPORTED.getDescription()).isEqualTo("Unsupported");
 		assertThat(SUBRIP.getDescription()).isEqualTo("SubRip");
-		assertThat(TEXT.getDescription()).isEqualTo("Text file");
+		assertThat(TEXT.getDescription()).isEqualTo("Text");
 		assertThat(MICRODVD.getDescription()).isEqualTo("MicroDVD");
-		assertThat(SAMI.getDescription()).isEqualTo("SAMI");
-		assertThat(ASS.getDescription()).isEqualTo("(Advanced) SubStation Alpha");
+		assertThat(SAMI.getDescription()).isEqualTo("Synchronized Accessible Media Interchange");
+		assertThat(ASS.getDescription()).isEqualTo("(Advanced) Sub Station Alpha");
 		assertThat(VOBSUB.getDescription()).isEqualTo("VobSub");
 		assertThat(USF.getDescription()).isEqualTo("Universal Subtitle Format");
-		assertThat(BMP.getDescription()).isEqualTo("BMP");
-		assertThat(DIVX.getDescription()).isEqualTo("DIVX subtitles");
-		assertThat(TX3G.getDescription()).isEqualTo("Timed text (TX3G)");
-		assertThat(PGS.getDescription()).isEqualTo("Blu-ray subtitles");
+		assertThat(BMP.getDescription()).isEqualTo("Bitmap");
+		assertThat(DIVX.getDescription()).isEqualTo("DivX subtitles");
+		assertThat(TX3G.getDescription()).isEqualTo("MPEG-4 Timed Text");
+		assertThat(PGS.getDescription()).isEqualTo("Presentation Grapic Stream");
+		assertThat(WEBVTT.getDescription()).isEqualTo("Web Video Text Tracks");
+		assertThat(TEXTST.getDescription()).isEqualTo("HDMV text SubTitles");
+		assertThat(DVBSUB.getDescription()).isEqualTo("DVB SUBtitles");
 	}
 
 	@Test
@@ -92,6 +98,7 @@ public class SubtitleTypeTest {
 		assertThat(VOBSUB.getExtension()).isEqualTo("idx");
 		assertThat(UNSUPPORTED.getExtension()).isEqualTo("");
 		assertThat(WEBVTT.getExtension()).isEqualTo("vtt");
+		assertThat(PGS.getExtension()).isEqualTo("sup");
 	}
 
 	@Test
@@ -143,7 +150,7 @@ public class SubtitleTypeTest {
 
 	@Test
 	public void getSupportedFileExtensions() {
-		Set<String> expectedExtensionsSet = new HashSet<>(Arrays.asList("srt", "txt", "sub", "smi", "ssa", "ass", "idx", "vtt"));
+		Set<String> expectedExtensionsSet = new HashSet<>(Arrays.asList("srt", "txt", "sub", "smi", "ssa", "ass", "idx", "vtt", "sup"));
 		assertThat(SubtitleType.getSupportedFileExtensions()).isEqualTo(expectedExtensionsSet);
 	}
 
@@ -163,6 +170,8 @@ public class SubtitleTypeTest {
 		assertThat(TX3G.getStableIndex()).isEqualTo(11);
 		assertThat(PGS.getStableIndex()).isEqualTo(12);
 		assertThat(WEBVTT.getStableIndex()).isEqualTo(13);
+		assertThat(TEXTST.getStableIndex()).isEqualTo(14);
+		assertThat(DVBSUB.getStableIndex()).isEqualTo(15);
 	}
 
 	@Test
@@ -190,6 +199,8 @@ public class SubtitleTypeTest {
 		assertThat(valueOfStableIndex(11)).isEqualTo(TX3G);
 		assertThat(valueOfStableIndex(12)).isEqualTo(PGS);
 		assertThat(valueOfStableIndex(13)).isEqualTo(WEBVTT);
+		assertThat(valueOfStableIndex(14)).isEqualTo(TEXTST);
+		assertThat(valueOfStableIndex(15)).isEqualTo(DVBSUB);
 	}
 
 	@Test
