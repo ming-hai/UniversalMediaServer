@@ -121,7 +121,6 @@ public class RendererConfiguration extends UPNPHelper.Renderer {
 	// property names
 	protected static final String ACCURATE_DLNA_ORGPN = "AccurateDLNAOrgPN";
 	protected static final String AUDIO = "Audio";
-	protected static final String AUTO_EXIF_ROTATE = "AutoExifRotate";
 	protected static final String AUTO_PLAY_TMO = "AutoPlayTmo";
 	protected static final String BYTE_TO_TIMESEEK_REWIND_SECONDS = "ByteToTimeseekRewindSeconds"; // Ditlew
 	protected static final String CBR_VIDEO_BITRATE = "CBRVideoBitrate"; // Ditlew
@@ -1205,10 +1204,6 @@ public class RendererConfiguration extends UPNPHelper.Renderer {
 	 */
 	public boolean isTranscodeToMPEG2() {
 		return isTranscodeToMPEGTSMPEG2AC3() || isTranscodeToMPEGPSMPEG2AC3();
-	}
-
-	public boolean isAutoRotateBasedOnExif() {
-		return getBoolean(AUTO_EXIF_ROTATE, false);
 	}
 
 	public boolean isTranscodeToMP3() {
