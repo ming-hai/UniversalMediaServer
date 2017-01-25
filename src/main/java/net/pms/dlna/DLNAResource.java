@@ -2410,7 +2410,7 @@ public abstract class DLNAResource extends HTTPResource implements Cloneable, Ru
 		}
 
 		MediaType mediaType = media != null ? media.getMediaType() : MediaType.UNKNOWN;
-		if (!isFolder && MediaType.IMAGE.equals(mediaType)) {
+		if (!isFolder && mediaType == MediaType.IMAGE) {
 			appendImage(sb);
 		} else if (!isFolder) {
 			int indexCount = 1;
@@ -2595,7 +2595,7 @@ public abstract class DLNAResource extends HTTPResource implements Cloneable, Ru
 		}
 
 		if (!(isFolder && !mediaRenderer.isSendFolderThumbnails())) {
-			if (!MediaType.UNKNOWN.equals(mediaType) && !MediaType.IMAGE.equals(mediaType)) {
+			if (mediaType != MediaType.UNKNOWN && mediaType != MediaType.IMAGE) {
 				appendThumbnail(sb, mediaType);
 			}
 		}
@@ -2626,9 +2626,9 @@ public abstract class DLNAResource extends HTTPResource implements Cloneable, Ru
 							break;
 					}
 				}
-			} else if (MediaType.IMAGE.equals(mediaType)) {
+			} else if (mediaType == MediaType.IMAGE) {
 				uclass = "object.item.imageItem.photo";
-			} else if (MediaType.AUDIO.equals(mediaType)) {
+			} else if (mediaType == MediaType.AUDIO) {
 				uclass = "object.item.audioItem.musicTrack";
 			} else {
 				uclass = "object.item.videoItem";
@@ -2809,7 +2809,7 @@ public abstract class DLNAResource extends HTTPResource implements Cloneable, Ru
 		 */
 
 		// Images add thumbnail resources together with the image resources in appendImage()
-		if (MediaType.VIDEO.equals(mediaType) || MediaType.AUDIO.equals(mediaType)) {
+		if (MediaType.VIDEO == mediaType || MediaType.AUDIO == mediaType) {
 
 			// Copy the reference for consistent results
 			ImageInfo imageInfo = thumbnailImageInfo;
