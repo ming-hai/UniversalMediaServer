@@ -1,12 +1,14 @@
-package net.pms.util;
+package net.pms.image;
 
 import java.awt.Color;
+import java.awt.Dimension;
 import java.awt.image.BufferedImage;
 import java.awt.image.ColorConvertOp;
 import java.awt.image.RenderedImage;
 import java.io.*;
 import java.lang.reflect.Field;
 import java.nio.file.Files;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Locale;
 import java.util.regex.Matcher;
@@ -16,15 +18,21 @@ import javax.imageio.ImageIO;
 import net.coobird.thumbnailator.Thumbnails;
 import net.coobird.thumbnailator.filters.Canvas;
 import net.coobird.thumbnailator.geometry.Positions;
-import net.coobird.thumbnailator.util.exif.ExifFilterUtils;
 import net.pms.dlna.DLNAImage;
 import net.pms.dlna.DLNAImageProfile;
 import net.pms.dlna.DLNAImageProfile.DLNAComplianceResult;
 import net.pms.dlna.DLNAMediaInfo;
 import net.pms.dlna.DLNAThumbnail;
-import net.pms.dlna.ImageInfo;
-import net.pms.formats.ImageFormat;
-import net.pms.util.CustomImageReader.ImageReaderResult;
+import net.pms.image.CustomImageReader.ImageReaderResult;
+import net.pms.image.metadata_extractor.GifReader;
+import net.pms.image.metadata_extractor.JpegDHTReader;
+import net.pms.image.metadata_extractor.StreamReader;
+import net.pms.image.thumbnailator.ExifFilterUtils;
+import net.pms.util.BufferedImageType;
+import net.pms.util.InvalidStateException;
+import net.pms.util.ParseException;
+import net.pms.util.ResettableBufferedInputStream;
+import net.pms.util.UnknownFormatException;
 import org.apache.commons.io.IOUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -33,36 +41,25 @@ import com.drew.imaging.FileTypeDetector;
 import com.drew.imaging.ImageMetadataReader;
 import com.drew.imaging.ImageProcessingException;
 import com.drew.imaging.bmp.BmpMetadataReader;
-import com.drew.imaging.gif.GifMetadataReader;
 import com.drew.imaging.ico.IcoMetadataReader;
 import com.drew.imaging.jpeg.JpegMetadataReader;
+import com.drew.imaging.jpeg.JpegSegmentMetadataReader;
 import com.drew.imaging.pcx.PcxMetadataReader;
 import com.drew.imaging.png.PngMetadataReader;
 import com.drew.imaging.psd.PsdMetadataReader;
 import com.drew.imaging.raf.RafMetadataReader;
 import com.drew.imaging.tiff.TiffMetadataReader;
-import com.drew.imaging.tiff.TiffProcessingException;
-import com.drew.imaging.tiff.TiffReader;
 import com.drew.imaging.webp.WebpMetadataReader;
-import com.drew.lang.RandomAccessFileReader;
 import com.drew.lang.RandomAccessStreamReader;
 import com.drew.metadata.Directory;
 import com.drew.metadata.Metadata;
 import com.drew.metadata.MetadataException;
-import com.drew.metadata.bmp.BmpHeaderDirectory;
-import com.drew.metadata.exif.ExifDirectoryBase;
 import com.drew.metadata.exif.ExifIFD0Directory;
+import com.drew.metadata.exif.ExifReader;
 import com.drew.metadata.exif.ExifSubIFDDirectory;
 import com.drew.metadata.exif.ExifThumbnailDirectory;
-import com.drew.metadata.exif.ExifTiffHandler;
-import com.drew.metadata.gif.GifHeaderDirectory;
-import com.drew.metadata.ico.IcoDirectory;
-import com.drew.metadata.jfif.JfifDirectory;
-import com.drew.metadata.jpeg.JpegDirectory;
-import com.drew.metadata.pcx.PcxDirectory;
-import com.drew.metadata.photoshop.PsdHeaderDirectory;
-import com.drew.metadata.png.PngDirectory;
-import com.drew.metadata.webp.WebpDirectory;
+import com.drew.metadata.jfif.JfifReader;
+import com.drew.metadata.jpeg.JpegReader;
 
 public class ImagesUtil {
 	private static final Logger LOGGER = LoggerFactory.getLogger(ImagesUtil.class);
@@ -118,6 +115,12 @@ public class ImagesUtil {
 			}
 
 			ImageFormat format = ImageFormat.toImageFormat(fileType);
+			if (format == null || format == ImageFormat.TIFF) {
+				ImageFormat tmpformat = ImageFormat.toImageFormat(metadata);
+				if (tmpformat != null) {
+					format = tmpformat;
+				}
+			}
 			if (inputStream.isFullResetAvailable()) {
 				inputStream.fullReset();
 			} else {
@@ -127,9 +130,8 @@ public class ImagesUtil {
 			}
 			ImageInfo imageInfo = null;
 			try {
-				imageInfo = CustomImageReader.readImageInfo(inputStream, size , metadata, true);
-				// From this point on metadata is Exif orientation compensated.
-			} catch (UnknownFormatException | IIOException e) {
+				imageInfo = CustomImageReader.readImageInfo(inputStream, size , metadata, false);
+			} catch (UnknownFormatException | IIOException | ParseException e) {
 				if (format == null) {
 					throw new UnknownFormatException(
 						"Unable to recognize image format for \"" + file.getAbsolutePath() + "\" - parsing failed",
@@ -145,16 +147,16 @@ public class ImagesUtil {
 				// Gather basic information from the data we have
 				if (metadata != null) {
 					try {
-						imageInfo = new ImageInfo(metadata, format, size, true, true);
-					} catch (MetadataException me) {
-						LOGGER.warn("Unable to parse metadata for \"{}\": {}", file.getAbsolutePath(), me.getMessage());
-						LOGGER.trace("", me);
+						imageInfo = ImageInfo.create(metadata, format, size, true, true);
+					} catch (ParseException pe) {
+						LOGGER.warn("Unable to parse metadata for \"{}\": {}", file.getAbsolutePath(), pe.getMessage());
+						LOGGER.trace("", pe);
 					}
 				}
 			}
 
 			if (imageInfo == null && format == null) {
-				throw new IOException("Parsing of \"" + file.getAbsolutePath() + "\" failed");
+				throw new ParseException("Parsing of \"" + file.getAbsolutePath() + "\" failed");
 			}
 
 			if (format == null) {
@@ -164,9 +166,13 @@ public class ImagesUtil {
 					if (format == ImageFormat.ARW && !isARW(metadata)) {
 						// XXX Remove this if https://github.com/drewnoakes/metadata-extractor/issues/217 is fixed
 						// Metadata extractor misidentifies some Photoshop created TIFFs for ARW, correct it
-						format = ImageFormat.TIFF;
+						format = ImageFormat.toImageFormat(metadata);
+						if (format == null) {
+							format = ImageFormat.TIFF;
+						}
 						LOGGER.trace(
-							"Correcting misidentified image format ARW to TIFF for \"{}\"",
+							"Correcting misidentified image format ARW to {} for \"{}\"",
+							format,
 							file.getAbsolutePath()
 						);
 					} else {
@@ -175,7 +181,7 @@ public class ImagesUtil {
 						 * of their close relationship let's treat them as what
 						 * they really are.
 						 */
-						imageInfo = new ImageInfo(
+						imageInfo = ImageInfo.create(
 							imageInfo.getWidth(),
 							imageInfo.getHeight(),
 							format,
@@ -241,6 +247,36 @@ public class ImagesUtil {
 	}
 
 	/**
+	 * @return The version number multiplied with 100 (last two digits are decimals).
+	 */
+	public static int parseExifVersion(byte[] bytes) {
+		if (bytes == null) {
+			return ImageInfo.UNKNOWN;
+		}
+		StringBuilder stringBuilder = new StringBuilder(4);
+		for (int i = 0; i < bytes.length; i++) {
+			if (bytes[i] > 47 && bytes[i] < 58) {
+				stringBuilder.append((char) bytes[i]);
+			} else if (bytes[i] == 0 && i == bytes.length - 1) {
+				// Some buggy C/C++ software doesn't properly format the string
+				// so we end up with a null-terminated string without the leading zero.
+				stringBuilder.insert(0, '0');
+			} else {
+				System.err.println((char) bytes[i]); //TODO (Nad) temp
+			}
+		}
+		while (stringBuilder.length() < 4) {
+			stringBuilder.append("0");
+		}
+		try {
+			return Integer.parseInt(stringBuilder.toString());
+		} catch (NumberFormatException e) {
+			LOGGER.debug("Failed to parse Exif version number from: {}", Arrays.toString(bytes));
+			return 0;
+		}
+	}
+
+	/**
 	 * Tries to parse {@link ExifOrientation} from the given metadata. If it
 	 * fails, {@link ExifOrientation#TOP_LEFT} is returned.
 	 *
@@ -282,23 +318,15 @@ public class ImagesUtil {
 	 * Checks if the resolution axes must be swapped if the image is rotated
 	 * according to the given Exif orientation.
 	 *
-	 * @param metadata the {@link Metadata} whose Exif orientation to evaluate.
-	 * @return {@code true} if the axes should be swapped, {@code false}
-	 *         otherwise.
-	 */
-	public static boolean isExifAxesSwapNeeded(Metadata metadata) {
-		return metadata != null && isExifAxesSwapNeeded(parseExifOrientation(metadata));
-	}
-
-	/**
-	 * Checks if the resolution axes must be swapped if the image is rotated
-	 * according to the given Exif orientation.
-	 *
 	 * @param orientation the Exif orientation to evaluate.
 	 * @return {@code true} if the axes should be swapped, {@code false}
 	 *         otherwise.
 	 */
+
 	public static boolean isExifAxesSwapNeeded(ExifOrientation orientation) {
+		if (orientation == null) {
+			return false;
+		}
 		switch (orientation) {
 			case LEFT_TOP:
 			case RIGHT_TOP:
@@ -310,240 +338,72 @@ public class ImagesUtil {
 		}
 	}
 
-
 	/**
-	 * <b>Use this method with care as it is a little bit tricky</b>. This
-	 * method returns a new {@link ImageInfo} instance if any changes are
-	 * required. If not, the argument is returned. If changes are needed, the
-	 * old {@link ImageInfo} instance is left untouched but its {@link Metadata}
-	 * instance is altered. This is because there's no way to copy/clone a
-	 * {@link Metadata} instance. The existing {@link Metadata} instance is
-	 * therefore altered and returned with the new {@link ImageInfo} instance -
-	 * which effectively invalidates the old {@link ImageInfo} instance.
+	 * Calculates the resolution for the image described by {@code imageInfo} if
+	 * it is scaled to {@code scaleWidth} width and {@code scaleHeight} height
+	 * while preserving aspect ratio.
 	 *
-	 * <b>In short, make sure not to use the {@link ImageInfo} argument after
-	 * calling this method, use the returned instance instead</b>
-	 *
-	 * This method transforms the {@link ImageInfo} instance and its
-	 * {@link Metadata} instance as if the image was transformed according to
-	 * Exif orientation. Resets Exif orientation to 1. Please note: This swaps
-	 * the axes of the basic tags, custom maker note tags etc. is beyond the
-	 * scope of this method. Thumbnail axes are also swapped.
-	 *
-	 * @param imageInfo the {@link ImageInfo} to transform according to its Exif
-	 *            orientation.
+	 * @param actualWidth the width of the source image.
+	 * @param actualHeight the height of the source image.
+	 * @param scaleType the {@link ScaleType} to use when scaling.
+	 * @param scaleWidth the width to scale to.
+	 * @param scaleHeight the height to scale to.
+	 * @return A {@link Dimension} with the resulting resolution.
 	 */
-	public static ImageInfo swapAxesIfNeeded(ImageInfo imageInfo) {
-		if (imageInfo != null && imageInfo.getExifOrientation() != ExifOrientation.TOP_LEFT) {
-			return imageInfo.copy(imageInfo.getMetadata(), true);
-		}
-		return imageInfo;
+	public static Dimension calculateScaledResolution(
+		ImageInfo imageInfo,
+		ScaleType scaleType,
+		int scaleWidth,
+		int scaleHeight
+	) {
+		return calculateScaledResolution(
+			imageInfo.getWidth(),
+			imageInfo.getHeight(),
+			scaleType,
+			scaleWidth,
+			scaleHeight
+		);
 	}
 
 	/**
-	 * Transforms the {@link Metadata} instance as if the image was transformed
-	 * according to Exif orientation. Resets Exif orientation to 1. Please note:
-	 * This swaps the axes of the basic tags, custom maker note tags etc. is
-	 * beyond the scope of this method. Thumbnail axes are also swapped.
+	 * Calculates the resolution for the image with {@code actualWidth} width
+	 * and {@code actualHeight}) height if it is scaled to {@code scaleWidth}
+	 * width and {@code scaleHeight} height while preserving aspect ratio.
 	 *
-	 * @param metadata the {@link Metadata} to transform according to its Exif
-	 *            orientation.
+	 * @param actualWidth the width of the source image.
+	 * @param actualHeight the height of the source image.
+	 * @param scaleType the {@link ScaleType} to use when scaling.
+	 * @param scaleWidth the width to scale to.
+	 * @param scaleHeight the height to scale to.
+	 * @return A {@link Dimension} with the resulting resolution.
 	 */
-	public static void swapAxesIfNeeded(Metadata metadata) {
-		if (isExifAxesSwapNeeded(metadata)) {
-			swapAxes(metadata);
-		} else if (metadata != null) {
-			for (Directory directory : metadata.getDirectories()) {
-				if (directory instanceof ExifDirectoryBase ) {
-					if (
-						((ExifDirectoryBase) directory).containsTag(ExifDirectoryBase.TAG_ORIENTATION)
-					) {
-						directory.setInt(ExifDirectoryBase.TAG_ORIENTATION, 1);
-					}
-				}
-			}
+	public static Dimension calculateScaledResolution(
+		int actualWidth,
+		int actualHeight,
+		ScaleType scaleType,
+		int scaleWidth,
+		int scaleHeight
+	) {
+		if (scaleType == null) {
+			throw new NullPointerException("scaleType cannot be null");
 		}
-	}
-
-	/**
-	 * Swaps the axes in the {@link Metadata} instance and resets Exif
-	 * orientation to 1. Please note: This swaps the axes of the basic tags,
-	 * custom maker note tags etc. is beyond the scope of this method. Thumbnail
-	 * axes are also swapped.
-	 *
-	 * @param metadata the {@link Metadata} instance to perform the axes swap
-	 *            on.
-	 */
-	public static void swapAxes(Metadata metadata) {
-		for (Directory directory : metadata.getDirectories()) {
-			if (directory instanceof PngDirectory) {
-				if (
-					((PngDirectory) directory).containsTag(PngDirectory.TAG_IMAGE_WIDTH) &&
-					((PngDirectory) directory).containsTag(PngDirectory.TAG_IMAGE_HEIGHT)
-				) {
-					Object value = ((PngDirectory) directory).getObject(PngDirectory.TAG_IMAGE_WIDTH);
-					directory.setObject(PngDirectory.TAG_IMAGE_WIDTH, ((PngDirectory) directory).getObject(PngDirectory.TAG_IMAGE_HEIGHT));
-					directory.setObject(PngDirectory.TAG_IMAGE_HEIGHT, value);
-				}
-				if (
-					((PngDirectory) directory).containsTag(PngDirectory.TAG_PIXELS_PER_UNIT_X) &&
-					((PngDirectory) directory).containsTag(PngDirectory.TAG_PIXELS_PER_UNIT_Y)
-				) {
-					Object value = ((PngDirectory) directory).getObject(PngDirectory.TAG_PIXELS_PER_UNIT_X);
-					directory.setObject(PngDirectory.TAG_PIXELS_PER_UNIT_X, ((PngDirectory) directory).getObject(PngDirectory.TAG_PIXELS_PER_UNIT_Y));
-					directory.setObject(PngDirectory.TAG_PIXELS_PER_UNIT_Y, value);
-				}
-			} else if (directory instanceof JpegDirectory) {
-				if (
-					((JpegDirectory) directory).containsTag(JpegDirectory.TAG_IMAGE_WIDTH) &&
-					((JpegDirectory) directory).containsTag(JpegDirectory.TAG_IMAGE_HEIGHT)
-				) {
-					Object value = ((JpegDirectory) directory).getObject(JpegDirectory.TAG_IMAGE_WIDTH);
-					directory.setObject(JpegDirectory.TAG_IMAGE_WIDTH, ((JpegDirectory) directory).getObject(JpegDirectory.TAG_IMAGE_HEIGHT));
-					directory.setObject(JpegDirectory.TAG_IMAGE_HEIGHT, value);
-				}
-			} else if (directory instanceof ExifDirectoryBase ) {
-				if (
-					((ExifDirectoryBase) directory).containsTag(ExifDirectoryBase.TAG_IMAGE_WIDTH) &&
-					((ExifDirectoryBase) directory).containsTag(ExifDirectoryBase.TAG_IMAGE_HEIGHT)
-				) {
-					Object value = ((ExifDirectoryBase) directory).getObject(ExifDirectoryBase.TAG_IMAGE_WIDTH);
-					directory.setObject(ExifDirectoryBase.TAG_IMAGE_WIDTH, ((ExifDirectoryBase) directory).getObject(ExifDirectoryBase.TAG_IMAGE_HEIGHT));
-					directory.setObject(ExifDirectoryBase.TAG_IMAGE_HEIGHT, value);
-				}
-
-				if (
-					((ExifDirectoryBase) directory).containsTag(ExifDirectoryBase.TAG_RELATED_IMAGE_WIDTH) &&
-					((ExifDirectoryBase) directory).containsTag(ExifDirectoryBase.TAG_RELATED_IMAGE_HEIGHT)
-				) {
-					Object value = ((ExifDirectoryBase) directory).getObject(ExifDirectoryBase.TAG_RELATED_IMAGE_WIDTH);
-					directory.setObject(ExifDirectoryBase.TAG_RELATED_IMAGE_WIDTH, ((ExifDirectoryBase) directory).getObject(ExifDirectoryBase.TAG_RELATED_IMAGE_HEIGHT));
-					directory.setObject(ExifDirectoryBase.TAG_RELATED_IMAGE_HEIGHT, value);
-				}
-
-				if (
-					((ExifDirectoryBase) directory).containsTag(ExifDirectoryBase.TAG_EXIF_IMAGE_WIDTH) &&
-					((ExifDirectoryBase) directory).containsTag(ExifDirectoryBase.TAG_EXIF_IMAGE_HEIGHT)
-				) {
-					Object value = ((ExifDirectoryBase) directory).getObject(ExifDirectoryBase.TAG_EXIF_IMAGE_WIDTH);
-					directory.setObject(ExifDirectoryBase.TAG_EXIF_IMAGE_WIDTH, ((ExifDirectoryBase) directory).getObject(ExifDirectoryBase.TAG_EXIF_IMAGE_HEIGHT));
-					directory.setObject(ExifDirectoryBase.TAG_EXIF_IMAGE_HEIGHT, value);
-				}
-				if (
-					((ExifDirectoryBase) directory).containsTag(ExifDirectoryBase.TAG_ORIENTATION)
-				) {
-					directory.setInt(ExifDirectoryBase.TAG_ORIENTATION, 1);
-				}
-			} else if (directory instanceof GifHeaderDirectory) {
-				if (
-					((GifHeaderDirectory) directory).containsTag(GifHeaderDirectory.TAG_IMAGE_WIDTH) &&
-					((GifHeaderDirectory) directory).containsTag(GifHeaderDirectory.TAG_IMAGE_HEIGHT)
-				) {
-					Object value = ((GifHeaderDirectory) directory).getObject(GifHeaderDirectory.TAG_IMAGE_WIDTH);
-					directory.setObject(GifHeaderDirectory.TAG_IMAGE_WIDTH, ((GifHeaderDirectory) directory).getObject(GifHeaderDirectory.TAG_IMAGE_HEIGHT));
-					directory.setObject(GifHeaderDirectory.TAG_IMAGE_HEIGHT, value);
-				}
-			} else if (directory instanceof BmpHeaderDirectory) {
-				if (
-					((BmpHeaderDirectory) directory).containsTag(BmpHeaderDirectory.TAG_IMAGE_WIDTH) &&
-					((BmpHeaderDirectory) directory).containsTag(BmpHeaderDirectory.TAG_IMAGE_HEIGHT)
-				) {
-					Object value = ((BmpHeaderDirectory) directory).getObject(BmpHeaderDirectory.TAG_IMAGE_WIDTH);
-					directory.setObject(BmpHeaderDirectory.TAG_IMAGE_WIDTH, ((BmpHeaderDirectory) directory).getObject(BmpHeaderDirectory.TAG_IMAGE_HEIGHT));
-					directory.setObject(BmpHeaderDirectory.TAG_IMAGE_HEIGHT, value);
-				}
-				if (
-					((BmpHeaderDirectory) directory).containsTag(BmpHeaderDirectory.TAG_X_PIXELS_PER_METER) &&
-					((BmpHeaderDirectory) directory).containsTag(BmpHeaderDirectory.TAG_Y_PIXELS_PER_METER)
-				) {
-					Object value = ((BmpHeaderDirectory) directory).getObject(BmpHeaderDirectory.TAG_X_PIXELS_PER_METER);
-					directory.setObject(BmpHeaderDirectory.TAG_X_PIXELS_PER_METER, ((BmpHeaderDirectory) directory).getObject(BmpHeaderDirectory.TAG_Y_PIXELS_PER_METER));
-					directory.setObject(BmpHeaderDirectory.TAG_Y_PIXELS_PER_METER, value);
-				}
-			} else if (directory instanceof IcoDirectory) {
-				if (
-					((IcoDirectory) directory).containsTag(IcoDirectory.TAG_IMAGE_WIDTH) &&
-					((IcoDirectory) directory).containsTag(IcoDirectory.TAG_IMAGE_HEIGHT)
-				) {
-					Object value = ((IcoDirectory) directory).getObject(IcoDirectory.TAG_IMAGE_WIDTH);
-					directory.setObject(IcoDirectory.TAG_IMAGE_WIDTH, ((IcoDirectory) directory).getObject(IcoDirectory.TAG_IMAGE_HEIGHT));
-					directory.setObject(IcoDirectory.TAG_IMAGE_HEIGHT, value);
-				}
-				if (
-					((IcoDirectory) directory).containsTag(IcoDirectory.TAG_CURSOR_HOTSPOT_X) &&
-					((IcoDirectory) directory).containsTag(IcoDirectory.TAG_CURSOR_HOTSPOT_Y)
-				) {
-					Object value = ((IcoDirectory) directory).getObject(IcoDirectory.TAG_CURSOR_HOTSPOT_X);
-					directory.setObject(IcoDirectory.TAG_CURSOR_HOTSPOT_X, ((IcoDirectory) directory).getObject(IcoDirectory.TAG_CURSOR_HOTSPOT_Y));
-					directory.setObject(IcoDirectory.TAG_CURSOR_HOTSPOT_Y, value);
-				}
-			} else if (directory instanceof JfifDirectory) {
-				if (
-					((JfifDirectory) directory).containsTag(JfifDirectory.TAG_RESX) &&
-					((JfifDirectory) directory).containsTag(JfifDirectory.TAG_RESY)
-				) {
-					Object value = ((JfifDirectory) directory).getObject(JfifDirectory.TAG_RESX);
-					directory.setObject(JfifDirectory.TAG_RESX, ((JfifDirectory) directory).getObject(JfifDirectory.TAG_RESY));
-					directory.setObject(JfifDirectory.TAG_RESY, value);
-				}
-				if (
-					((JfifDirectory) directory).containsTag(JfifDirectory.TAG_THUMB_WIDTH) &&
-					((JfifDirectory) directory).containsTag(JfifDirectory.TAG_THUMB_HEIGHT)
-				) {
-					Object value = ((JfifDirectory) directory).getObject(JfifDirectory.TAG_THUMB_WIDTH);
-					directory.setObject(JfifDirectory.TAG_THUMB_WIDTH, ((JfifDirectory) directory).getObject(JfifDirectory.TAG_THUMB_HEIGHT));
-					directory.setObject(JfifDirectory.TAG_THUMB_HEIGHT, value);
-				}
-			} else if (directory instanceof PcxDirectory) {
-				if (
-					((PcxDirectory) directory).containsTag(PcxDirectory.TAG_XMIN) &&
-					((PcxDirectory) directory).containsTag(PcxDirectory.TAG_XMAX) &&
-					((PcxDirectory) directory).containsTag(PcxDirectory.TAG_YMIN) &&
-					((PcxDirectory) directory).containsTag(PcxDirectory.TAG_YMAX)
-				) {
-					Object value = ((PcxDirectory) directory).getObject(PcxDirectory.TAG_XMIN);
-					directory.setObject(PcxDirectory.TAG_XMIN, ((PcxDirectory) directory).getObject(PcxDirectory.TAG_YMIN));
-					directory.setObject(PcxDirectory.TAG_YMIN, value);
-					value = ((PcxDirectory) directory).getObject(PcxDirectory.TAG_XMAX);
-					directory.setObject(PcxDirectory.TAG_XMAX, ((PcxDirectory) directory).getObject(PcxDirectory.TAG_YMAX));
-					directory.setObject(PcxDirectory.TAG_YMAX, value);
-				}
-				if (
-					((PcxDirectory) directory).containsTag(PcxDirectory.TAG_HORIZONTAL_DPI) &&
-					((PcxDirectory) directory).containsTag(PcxDirectory.TAG_VERTICAL_DPI)
-				) {
-					Object value = ((PcxDirectory) directory).getObject(PcxDirectory.TAG_HORIZONTAL_DPI);
-					directory.setObject(PcxDirectory.TAG_HORIZONTAL_DPI, ((PcxDirectory) directory).getObject(PcxDirectory.TAG_VERTICAL_DPI));
-					directory.setObject(PcxDirectory.TAG_VERTICAL_DPI, value);
-				}
-				if (
-					((PcxDirectory) directory).containsTag(PcxDirectory.TAG_HSCR_SIZE) &&
-					((PcxDirectory) directory).containsTag(PcxDirectory.TAG_VSCR_SIZE)
-				) {
-					Object value = ((PcxDirectory) directory).getObject(PcxDirectory.TAG_HSCR_SIZE);
-					directory.setObject(PcxDirectory.TAG_HSCR_SIZE, ((PcxDirectory) directory).getObject(PcxDirectory.TAG_VSCR_SIZE));
-					directory.setObject(PcxDirectory.TAG_VSCR_SIZE, value);
-				}
-			} else if (directory instanceof PsdHeaderDirectory) {
-				if (
-					((PsdHeaderDirectory) directory).containsTag(PsdHeaderDirectory.TAG_IMAGE_WIDTH) &&
-					((PsdHeaderDirectory) directory).containsTag(PsdHeaderDirectory.TAG_IMAGE_HEIGHT)
-				) {
-					Object value = ((PsdHeaderDirectory) directory).getObject(PsdHeaderDirectory.TAG_IMAGE_WIDTH);
-					directory.setObject(PsdHeaderDirectory.TAG_IMAGE_WIDTH, ((PsdHeaderDirectory) directory).getObject(PsdHeaderDirectory.TAG_IMAGE_HEIGHT));
-					directory.setObject(PsdHeaderDirectory.TAG_IMAGE_HEIGHT, value);
-				}
-			} else if (directory instanceof WebpDirectory) {
-				if (
-					((WebpDirectory) directory).containsTag(WebpDirectory.TAG_IMAGE_WIDTH) &&
-					((WebpDirectory) directory).containsTag(WebpDirectory.TAG_IMAGE_HEIGHT)
-				) {
-					Object value = ((WebpDirectory) directory).getObject(WebpDirectory.TAG_IMAGE_WIDTH);
-					directory.setObject(WebpDirectory.TAG_IMAGE_WIDTH, ((WebpDirectory) directory).getObject(WebpDirectory.TAG_IMAGE_HEIGHT));
-					directory.setObject(WebpDirectory.TAG_IMAGE_HEIGHT, value);
-				}
-			}
+		if (actualWidth < 1 || actualHeight < 1) {
+			throw new IllegalArgumentException(String.format(
+				"actualWidth (%d) and actualHeight (%d) must be positive", actualWidth, actualHeight
+			));
 		}
+		if (scaleWidth < 1 || scaleHeight < 1) {
+			throw new IllegalArgumentException(String.format(
+				"scaleWidth (%d) and scaleHeight (%d) must be positive", scaleWidth, scaleHeight
+			));
+		}
+
+		double scale = Math.min((double) scaleWidth / actualWidth, (double) scaleHeight / actualHeight);
+		if (scaleType == ScaleType.MAX && scale > 1) {
+			// Never scale up for ScaleType.MAX
+			scale = 1;
+		}
+		return new Dimension((int) Math.round(actualWidth * scale), (int) Math.round(actualHeight * scale));
 	}
 
 	/**
@@ -602,15 +462,10 @@ public class ImagesUtil {
 	 * Converts an image to a different {@link ImageFormat}. Rotates/flips the
 	 * image according to Exif orientation. Format support is limited to that of
 	 * {@link ImageIO}.
-	 * <p>
-	 * <b> This method consumes and closes {@code inputStream}. </b>
 	 *
 	 * @param inputImage the source {@link Image}.
 	 * @param outputFormat the {@link ImageFormat} to convert to. If this is
 	 *            {@link ImageFormat#SOURCE} or {@code null} this has no effect.
-	 * @param updateMetadata whether or not new metadata should be updated after
-	 *            image transformation. This should only be disabled if the
-	 *            output image won't be kept/reused.
 	 * @param dlnaCompliant whether or not the output image should be restricted
 	 *            to DLNA compliance. This also means that the output can be
 	 *            safely cast to {@link DLNAImage}.
@@ -624,11 +479,19 @@ public class ImagesUtil {
 	public static Image convertImage(
 		Image inputImage,
 		ImageFormat outputFormat,
-		boolean updateMetadata,
 		boolean dlnaCompliant,
 		boolean dlnaThumbnail
 	) throws IOException {
-		return transcodeImage(inputImage, 0, 0, null, outputFormat, updateMetadata, dlnaCompliant, dlnaThumbnail, false);
+		return transcodeImage(
+			inputImage,
+			0,
+			0,
+			null,
+			outputFormat,
+			dlnaCompliant,
+			dlnaThumbnail,
+			false
+		);
 	}
 
 	/**
@@ -641,9 +504,6 @@ public class ImagesUtil {
 	 * @param inputStream the source image in a supported format.
 	 * @param outputFormat the {@link ImageFormat} to convert to. If this is
 	 *            {@link ImageFormat#SOURCE} or {@code null} this has no effect.
-	 * @param updateMetadata whether or not new metadata should be updated after
-	 *            image transformation. This should only be disabled if the
-	 *            output image won't be kept/reused.
 	 * @param dlnaCompliant whether or not the output image should be restricted
 	 *            to DLNA compliance. This also means that the output can be
 	 *            safely cast to {@link DLNAImage}.
@@ -657,11 +517,19 @@ public class ImagesUtil {
 	public static Image convertImage(
 		InputStream inputStream,
 		ImageFormat outputFormat,
-		boolean updateMetadata,
 		boolean dlnaCompliant,
 		boolean dlnaThumbnail
 	) throws IOException {
-		return transcodeImage(inputStream, 0, 0, null, outputFormat, updateMetadata, dlnaCompliant, dlnaThumbnail, false);
+		return transcodeImage(
+			inputStream,
+			0,
+			0,
+			null,
+			outputFormat,
+			dlnaCompliant,
+			dlnaThumbnail,
+			false
+		);
 	}
 
 	/**
@@ -672,9 +540,6 @@ public class ImagesUtil {
 	 * @param inputByteArray the source image in a supported format.
 	 * @param outputFormat the {@link ImageFormat} to convert to. If this is
 	 *            {@link ImageFormat#SOURCE} or {@code null} this has no effect.
-	 * @param updateMetadata whether or not new metadata should be updated after
-	 *            image transformation. This should only be disabled if the
-	 *            output image won't be kept/reused.
 	 * @param dlnaCompliant whether or not the output image should be restricted
 	 *            to DLNA compliance. This also means that the output can be
 	 *            safely cast to {@link DLNAImage}.
@@ -688,11 +553,19 @@ public class ImagesUtil {
 	public static Image convertImage(
 		byte[] inputByteArray,
 		ImageFormat outputFormat,
-		boolean updateMetadata,
 		boolean dlnaCompliant,
 		boolean dlnaThumbnail
 	) throws IOException {
-		return transcodeImage(inputByteArray, 0, 0, null, outputFormat, updateMetadata, dlnaCompliant, dlnaThumbnail, false);
+		return transcodeImage(
+			inputByteArray,
+			0,
+			0,
+			null,
+			outputFormat,
+			dlnaCompliant,
+			dlnaThumbnail,
+			false
+		);
 	}
 
 	/**
@@ -704,9 +577,6 @@ public class ImagesUtil {
 	 * @param width the new width.
 	 * @param height the new height.
 	 * @param scaleType the {@link ScaleType} to use when scaling.
-	 * @param updateMetadata whether or not new metadata should be updated after
-	 *            image transformation. This should only be disabled if the
-	 *            output image won't be kept/reused.
 	 * @param dlnaCompliant whether or not the output image should be restricted
 	 *            to DLNA compliance. This also means that the output can be
 	 *            safely cast to {@link DLNAImage}.
@@ -723,26 +593,33 @@ public class ImagesUtil {
 		int width,
 		int height,
 		ScaleType scaleType,
-		boolean updateMetadata,
 		boolean dlnaCompliant,
 		boolean dlnaThumbnail,
 		boolean padToSize
 	) throws IOException {
-		return transcodeImage(inputImage, width, height, scaleType, ImageFormat.SOURCE, updateMetadata, dlnaCompliant, dlnaThumbnail, padToSize);
+		return transcodeImage(
+			inputImage,
+			width,
+			height,
+			scaleType,
+			ImageFormat.SOURCE,
+			dlnaCompliant,
+			dlnaThumbnail,
+			padToSize
+		);
 	}
 
 	/**
 	 * Scales an image to the given dimensions. Scaling can be with or without
 	 * padding. Preserves aspect ratio and rotates/flips the image according to
 	 * Exif orientation. Format support is limited to that of {@link ImageIO}.
+	 * <p>
+	 * <b> This method consumes and closes {@code inputStream}. </b>
 	 *
 	 * @param inputStream the source image in a supported format.
 	 * @param width the new width.
 	 * @param height the new height.
 	 * @param scaleType the {@link ScaleType} to use when scaling.
-	 * @param updateMetadata whether or not new metadata should be updated after
-	 *            image transformation. This should only be disabled if the
-	 *            output image won't be kept/reused.
 	 * @param dlnaCompliant whether or not the output image should be restricted
 	 *            to DLNA compliance. This also means that the output can be
 	 *            safely cast to {@link DLNAImage}.
@@ -759,12 +636,20 @@ public class ImagesUtil {
 		int width,
 		int height,
 		ScaleType scaleType,
-		boolean updateMetadata,
 		boolean dlnaCompliant,
 		boolean dlnaThumbnail,
 		boolean padToSize
 	) throws IOException {
-		return transcodeImage(inputStream, width, height, scaleType, ImageFormat.SOURCE, updateMetadata, dlnaCompliant, dlnaThumbnail, padToSize);
+		return transcodeImage(
+			inputStream,
+			width,
+			height,
+			scaleType,
+			ImageFormat.SOURCE,
+			dlnaCompliant,
+			dlnaThumbnail,
+			padToSize
+		);
 	}
 
 	/**
@@ -776,9 +661,6 @@ public class ImagesUtil {
 	 * @param width the new width.
 	 * @param height the new height.
 	 * @param scaleType the {@link ScaleType} to use when scaling.
-	 * @param updateMetadata whether or not new metadata should be updated after
-	 *            image transformation. This should only be disabled if the
-	 *            output image won't be kept/reused.
 	 * @param dlnaCompliant whether or not the output image should be restricted
 	 *            to DLNA compliance. This also means that the output can be
 	 *            safely cast to {@link DLNAImage}.
@@ -796,12 +678,20 @@ public class ImagesUtil {
 		int width,
 		int height,
 		ScaleType scaleType,
-		boolean updateMetadata,
 		boolean dlnaCompliant,
 		boolean dlnaThumbnail,
 		boolean padToSize
 	) throws IOException {
-		return transcodeImage(inputByteArray, width, height, scaleType, ImageFormat.SOURCE, updateMetadata, dlnaCompliant, dlnaThumbnail, padToSize);
+		return transcodeImage(
+			inputByteArray,
+			width,
+			height,
+			scaleType,
+			ImageFormat.SOURCE,
+			dlnaCompliant,
+			dlnaThumbnail,
+			padToSize
+		);
 	}
 
 	/**
@@ -809,14 +699,9 @@ public class ImagesUtil {
 	 * {@link DLNAImageProfile}. Preserves aspect ratio and rotates/flips the
 	 * image according to Exif orientation. Format support is limited to that of
 	 * {@link ImageIO}.
-	 * <p>
-	 * <b> This method consumes and closes {@code inputStream}. </b>
 	 *
 	 * @param inputImage the source {@link Image}.
 	 * @param outputProfile the {@link DLNAImageProfile} to convert to.
-	 * @param updateMetadata whether or not new metadata should be updated after
-	 *            image transformation. This should only be disabled if the
-	 *            output image won't be kept/reused.
 	 * @param dlnaThumbnail whether or not the output image should be restricted
 	 *            to DLNA thumbnail compliance. This also means that the output
 	 *            can be safely cast to {@link DLNAThumbnail}.
@@ -829,11 +714,10 @@ public class ImagesUtil {
 	public static Image transcodeImage(
 		Image inputImage,
 		DLNAImageProfile outputProfile,
-		boolean updateMetadata,
 		boolean dlnaThumbnail,
 		boolean padToSize
 	) throws IOException {
-		return transcodeImage(inputImage, 0, 0, null, outputProfile, updateMetadata, true, dlnaThumbnail, padToSize);
+		return transcodeImage(inputImage, 0, 0, null, outputProfile, true, dlnaThumbnail, padToSize);
 	}
 
 	/**
@@ -846,9 +730,6 @@ public class ImagesUtil {
 	 *
 	 * @param inputStream the source image in a supported format.
 	 * @param outputProfile the {@link DLNAImageProfile} to convert to.
-	 * @param updateMetadata whether or not new metadata should be updated after
-	 *            image transformation. This should only be disabled if the
-	 *            output image won't be kept/reused.
 	 * @param dlnaThumbnail whether or not the output image should be restricted
 	 *            to DLNA thumbnail compliance. This also means that the output
 	 *            can be safely cast to {@link DLNAThumbnail}.
@@ -861,11 +742,10 @@ public class ImagesUtil {
 	public static Image transcodeImage(
 		InputStream inputStream,
 		DLNAImageProfile outputProfile,
-		boolean updateMetadata,
 		boolean dlnaThumbnail,
 		boolean padToSize
 	) throws IOException {
-		return transcodeImage(inputStream, 0, 0, null, outputProfile, updateMetadata, true, dlnaThumbnail, padToSize);
+		return transcodeImage(inputStream, 0, 0, null, outputProfile, true, dlnaThumbnail, padToSize);
 	}
 
 	/**
@@ -873,14 +753,9 @@ public class ImagesUtil {
 	 * {@link DLNAImageProfile}. Preserves aspect ratio and rotates/flips the
 	 * image according to Exif orientation. Format support is limited to that of
 	 * {@link ImageIO}.
-	 * <p>
-	 * <b> This method consumes and closes {@code inputStream}. </b>
 	 *
 	 * @param inputByteArray the source image in a supported format.
 	 * @param outputProfile the {@link DLNAImageProfile} to convert to.
-	 * @param updateMetadata whether or not new metadata should be updated after
-	 *            image transformation. This should only be disabled if the
-	 *            output image won't be kept/reused.
 	 * @param dlnaThumbnail whether or not the output image should be restricted
 	 *            to DLNA thumbnail compliance. This also means that the output
 	 *            can be safely cast to {@link DLNAThumbnail}.
@@ -893,11 +768,10 @@ public class ImagesUtil {
 	public static Image transcodeImage(
 		byte[] inputByteArray,
 		DLNAImageProfile outputProfile,
-		boolean updateMetadata,
 		boolean dlnaThumbnail,
 		boolean padToSize
 	) throws IOException {
-		return transcodeImage(inputByteArray, 0, 0, null, outputProfile, updateMetadata, true, dlnaThumbnail, padToSize);
+		return transcodeImage(inputByteArray, 0, 0, null, outputProfile, true, dlnaThumbnail, padToSize);
 	}
 
 	/**
@@ -908,18 +782,12 @@ public class ImagesUtil {
 	 * given call. Note that {@code outputProfile} overrides
 	 * {@code outputFormat}.
 	 *
-	 * <p>
-	 * <b> This method consumes and closes {@code inputStream}. </b>
-	 *
 	 * @param inputImage the source {@link Image}.
 	 * @param width the new width or 0 to disable scaling.
 	 * @param height the new height or 0 to disable scaling.
 	 * @param scaleType the {@link ScaleType} to use when scaling.
 	 * @param outputFormat the {@link ImageFormat} to convert to or
 	 *            {@link ImageFormat#SOURCE} to preserve source format.
-	 * @param updateMetadata whether or not new metadata should be updated after
-	 *            image transformation. This should only be disabled if the
-	 *            output image won't be kept/reused.
 	 * @param dlnaCompliant whether or not the output image should be restricted
 	 *            to DLNA compliance. This also means that the output can be
 	 *            safely cast to {@link DLNAImage}.
@@ -938,12 +806,23 @@ public class ImagesUtil {
 		int height,
 		ScaleType scaleType,
 		ImageFormat outputFormat,
-		boolean updateMetadata,
 		boolean dlnaCompliant,
 		boolean dlnaThumbnail,
 		boolean padToSize
 	) throws IOException {
-		return transcodeImage(null, inputImage, null, width, height, scaleType, outputFormat, null, updateMetadata, dlnaCompliant, dlnaThumbnail, padToSize);
+		return transcodeImage(
+			null,
+			inputImage,
+			null,
+			width,
+			height,
+			scaleType,
+			outputFormat,
+			null,
+			dlnaCompliant,
+			dlnaThumbnail,
+			padToSize
+		);
 	}
 
 	/**
@@ -953,7 +832,6 @@ public class ImagesUtil {
 	 * {@link ImageIO}. Only one of the three input arguments may be used in any
 	 * given call. Note that {@code outputProfile} overrides
 	 * {@code outputFormat}.
-	 *
 	 * <p>
 	 * <b> This method consumes and closes {@code inputStream}. </b>
 	 *
@@ -963,9 +841,6 @@ public class ImagesUtil {
 	 * @param scaleType the {@link ScaleType} to use when scaling.
 	 * @param outputFormat the {@link ImageFormat} to convert to or
 	 *            {@link ImageFormat#SOURCE} to preserve source format.
-	 * @param updateMetadata whether or not new metadata should be updated after
-	 *            image transformation. This should only be disabled if the
-	 *            output image won't be kept/reused.
 	 * @param dlnaCompliant whether or not the output image should be restricted
 	 *            to DLNA compliance. This also means that the output can be
 	 *            safely cast to {@link DLNAImage}.
@@ -984,12 +859,23 @@ public class ImagesUtil {
 		int height,
 		ScaleType scaleType,
 		ImageFormat outputFormat,
-		boolean updateMetadata,
 		boolean dlnaCompliant,
 		boolean dlnaThumbnail,
 		boolean padToSize
 	) throws IOException {
-		return transcodeImage(null, null, inputStream, width, height, scaleType, outputFormat, null, updateMetadata, dlnaCompliant, dlnaThumbnail, padToSize);
+		return transcodeImage(
+			null,
+			null,
+			inputStream,
+			width,
+			height,
+			scaleType,
+			outputFormat,
+			null,
+			dlnaCompliant,
+			dlnaThumbnail,
+			padToSize
+		);
 	}
 
 	/**
@@ -1000,18 +886,12 @@ public class ImagesUtil {
 	 * given call. Note that {@code outputProfile} overrides
 	 * {@code outputFormat}.
 	 *
-	 * <p>
-	 * <b> This method consumes and closes {@code inputStream}. </b>
-	 *
 	 * @param inputByteArray the source image in a supported format.
 	 * @param width the new width or 0 to disable scaling.
 	 * @param height the new height or 0 to disable scaling.
 	 * @param scaleType the {@link ScaleType} to use when scaling.
 	 * @param outputFormat the {@link ImageFormat} to convert to or
 	 *            {@link ImageFormat#SOURCE} to preserve source format.
-	 * @param updateMetadata whether or not new metadata should be updated after
-	 *            image transformation. This should only be disabled if the
-	 *            output image won't be kept/reused.
 	 * @param dlnaCompliant whether or not the output image should be restricted
 	 *            to DLNA compliance. This also means that the output can be
 	 *            safely cast to {@link DLNAImage}.
@@ -1030,12 +910,23 @@ public class ImagesUtil {
 		int height,
 		ScaleType scaleType,
 		ImageFormat outputFormat,
-		boolean updateMetadata,
 		boolean dlnaCompliant,
 		boolean dlnaThumbnail,
 		boolean padToSize
 	) throws IOException {
-		return transcodeImage(inputByteArray, null, null, width, height, scaleType, outputFormat, null, updateMetadata, dlnaCompliant, dlnaThumbnail, padToSize);
+		return transcodeImage(
+			inputByteArray,
+			null,
+			null,
+			width,
+			height,
+			scaleType,
+			outputFormat,
+			null,
+			dlnaCompliant,
+			dlnaThumbnail,
+			padToSize
+		);
 	}
 
 	/**
@@ -1046,17 +937,11 @@ public class ImagesUtil {
 	 * given call. Note that {@code outputProfile} overrides
 	 * {@code outputFormat}.
 	 *
-	 * <p>
-	 * <b> This method consumes and closes {@code inputStream}. </b>
-	 *
 	 * @param inputImage the source {@link Image}.
 	 * @param width the new width or 0 to disable scaling.
 	 * @param height the new height or 0 to disable scaling.
 	 * @param scaleType the {@link ScaleType} to use when scaling.
 	 * @param outputProfile the {@link DLNAImageProfile} to convert to.
-	 * @param updateMetadata whether or not new metadata should be updated after
-	 *            image transformation. This should only be disabled if the
-	 *            output image won't be kept/reused.
 	 * @param dlnaCompliant whether or not the output image should be restricted
 	 *            to DLNA compliance. This also means that the output can be
 	 *            safely cast to {@link DLNAImage}.
@@ -1075,12 +960,23 @@ public class ImagesUtil {
 		int height,
 		ScaleType scaleType,
 		DLNAImageProfile outputProfile,
-		boolean updateMetadata,
 		boolean dlnaCompliant,
 		boolean dlnaThumbnail,
 		boolean padToSize
 	) throws IOException {
-		return transcodeImage(null, inputImage, null, width, height, scaleType, null, outputProfile, updateMetadata, dlnaCompliant, dlnaThumbnail, padToSize);
+		return transcodeImage(
+			null,
+			inputImage,
+			null,
+			width,
+			height,
+			scaleType,
+			null,
+			outputProfile,
+			dlnaCompliant,
+			dlnaThumbnail,
+			padToSize
+		);
 	}
 
 	/**
@@ -1090,7 +986,6 @@ public class ImagesUtil {
 	 * {@link ImageIO}. Only one of the three input arguments may be used in any
 	 * given call. Note that {@code outputProfile} overrides
 	 * {@code outputFormat}.
-	 *
 	 * <p>
 	 * <b> This method consumes and closes {@code inputStream}. </b>
 	 *
@@ -1099,9 +994,6 @@ public class ImagesUtil {
 	 * @param height the new height or 0 to disable scaling.
 	 * @param scaleType the {@link ScaleType} to use when scaling.
 	 * @param outputProfile the {@link DLNAImageProfile} to convert to.
-	 * @param updateMetadata whether or not new metadata should be updated after
-	 *            image transformation. This should only be disabled if the
-	 *            output image won't be kept/reused.
 	 * @param dlnaCompliant whether or not the output image should be restricted
 	 *            to DLNA compliance. This also means that the output can be
 	 *            safely cast to {@link DLNAImage}.
@@ -1120,12 +1012,23 @@ public class ImagesUtil {
 		int height,
 		ScaleType scaleType,
 		DLNAImageProfile outputProfile,
-		boolean updateMetadata,
 		boolean dlnaCompliant,
 		boolean dlnaThumbnail,
 		boolean padToSize
 	) throws IOException {
-		return transcodeImage(null, null, inputStream, width, height, scaleType, null, outputProfile, updateMetadata, dlnaCompliant, dlnaThumbnail, padToSize);
+		return transcodeImage(
+			null,
+			null,
+			inputStream,
+			width,
+			height,
+			scaleType,
+			null,
+			outputProfile,
+			dlnaCompliant,
+			dlnaThumbnail,
+			padToSize
+		);
 	}
 
 	/**
@@ -1136,17 +1039,11 @@ public class ImagesUtil {
 	 * given call. Note that {@code outputProfile} overrides
 	 * {@code outputFormat}.
 	 *
-	 * <p>
-	 * <b> This method consumes and closes {@code inputStream}. </b>
-	 *
 	 * @param inputByteArray the source image in a supported format.
 	 * @param width the new width or 0 to disable scaling.
 	 * @param height the new height or 0 to disable scaling.
 	 * @param scaleType the {@link ScaleType} to use when scaling.
 	 * @param outputProfile the {@link DLNAImageProfile} to convert to.
-	 * @param updateMetadata whether or not new metadata should be updated after
-	 *            image transformation. This should only be disabled if the
-	 *            output image won't be kept/reused.
 	 * @param dlnaCompliant whether or not the output image should be restricted
 	 *            to DLNA compliance. This also means that the output can be
 	 *            safely cast to {@link DLNAImage}.
@@ -1165,12 +1062,23 @@ public class ImagesUtil {
 		int height,
 		ScaleType scaleType,
 		DLNAImageProfile outputProfile,
-		boolean updateMetadata,
 		boolean dlnaCompliant,
 		boolean dlnaThumbnail,
 		boolean padToSize
 	) throws IOException {
-		return transcodeImage(inputByteArray, null, null, width, height, scaleType, null, outputProfile, updateMetadata, dlnaCompliant, dlnaThumbnail, padToSize);
+		return transcodeImage(
+			inputByteArray,
+			null,
+			null,
+			width,
+			height,
+			scaleType,
+			null,
+			outputProfile,
+			dlnaCompliant,
+			dlnaThumbnail,
+			padToSize
+		);
 	}
 
 	/**
@@ -1180,7 +1088,6 @@ public class ImagesUtil {
 	 * {@link ImageIO}. Only one of the three input arguments may be used in any
 	 * given call. Note that {@code outputProfile} overrides
 	 * {@code outputFormat}.
-	 *
 	 * <p>
 	 * <b> This method consumes and closes {@code inputStream}. </b>
 	 *
@@ -1195,9 +1102,6 @@ public class ImagesUtil {
 	 *            Overridden by {@code outputProfile}.
 	 * @param outputProfile the {@link DLNAImageProfile} to convert to. This
 	 *            overrides {@code outputFormat}.
-	 * @param updateMetadata whether or not new metadata should be updated after
-	 *            image transformation. This should only be disabled if the
-	 *            output image won't be kept/reused.
 	 * @param dlnaCompliant whether or not the output image should be restricted
 	 *            to DLNA compliance. This also means that the output can be
 	 *            safely cast to {@link DLNAImage}.
@@ -1219,7 +1123,6 @@ public class ImagesUtil {
 		ScaleType scaleType,
 		ImageFormat outputFormat,
 		DLNAImageProfile outputProfile,
-		boolean updateMetadata,
 		boolean dlnaCompliant,
 		boolean dlnaThumbnail,
 		boolean padToSize
@@ -1235,6 +1138,7 @@ public class ImagesUtil {
 			throw new IllegalArgumentException("Use either inputByteArray, inputImage or inputStream");
 		}
 		ImageIO.setUseCache(false);
+		dlnaCompliant = dlnaCompliant || dlnaThumbnail;
 
 		if (inputImage != null) {
 			inputByteArray = inputImage.getBytes(false);
@@ -1275,8 +1179,12 @@ public class ImagesUtil {
 			outputFormat = inputResult.imageFormat;
 		}
 
-		if (outputProfile == null && (dlnaCompliant || dlnaThumbnail)) {
-			// Override output format to one valid for DLNA, defaulting to JPEG
+		BufferedImage bufferedImage = inputResult.bufferedImage;
+		boolean reencode = false;
+
+		if (outputProfile == null && dlnaCompliant) {
+			// Override output format to one valid for DLNA, defaulting to PNG
+			// if the source image has alpha and JPEG if not.
 			switch (outputFormat) {
 				case GIF:
 					if (dlnaThumbnail) {
@@ -1287,26 +1195,32 @@ public class ImagesUtil {
 				case PNG:
 					break;
 				default:
-					outputFormat = ImageFormat.JPEG;
+					if (bufferedImage.getColorModel().hasAlpha()) {
+						outputFormat = ImageFormat.PNG;
+					} else {
+						outputFormat = ImageFormat.JPEG;
+					}
 			}
 		}
 
 		Metadata metadata = null;
-		try {
-			metadata = inputImage != null ? inputImage.getMetadata() : getMetadata(inputByteArray, inputResult.imageFormat);
-		} catch (IOException | ImageProcessingException e) {
-			LOGGER.error("Failed to read input image metadata: {}", e.getMessage());
-			LOGGER.trace("", e);
-			metadata = new Metadata();
-		}
-		if (metadata == null) {
-			metadata = new Metadata();
+		ExifOrientation orientation;
+		if (inputImage != null && inputImage.getImageInfo() != null) {
+			orientation = inputImage.getImageInfo().getExifOrientation();
+		} else {
+			try {
+				metadata = getMetadata(inputByteArray, inputResult.imageFormat);
+			} catch (IOException | ImageProcessingException e) {
+				LOGGER.error("Failed to read input image metadata: {}", e.getMessage());
+				LOGGER.trace("", e);
+				metadata = new Metadata();
+			}
+			if (metadata == null) {
+				metadata = new Metadata();
+			}
+			orientation = parseExifOrientation(metadata);
 		}
 
-		BufferedImage bufferedImage = inputResult.bufferedImage;
-		boolean reencode = false;
-
-		ExifOrientation orientation = parseExifOrientation(metadata);
 		if (orientation != ExifOrientation.TOP_LEFT) {
 			// Rotate the image before doing all the other checks
 			BufferedImage oldBufferedImage = bufferedImage;
@@ -1331,25 +1245,51 @@ public class ImagesUtil {
 			reencode = true;
 		}
 
+		if (outputProfile == null && dlnaCompliant) {
+			// Set a suitable output profile.
+			if (width < 1 || height < 1) {
+				outputProfile = DLNAImageProfile.getClosestDLNAProfile(
+					bufferedImage.getWidth(),
+					bufferedImage.getHeight(),
+					outputFormat,
+					true
+				);
+			} else {
+				Dimension targetResolution = calculateScaledResolution(
+					bufferedImage.getWidth(),
+					bufferedImage.getHeight(),
+					scaleType,
+					width,
+					height
+				);
+				outputProfile = DLNAImageProfile.getClosestDLNAProfile(
+					targetResolution.width,
+					targetResolution.height,
+					outputFormat,
+					true
+				);
+			}
+			width = outputProfile.getMaxWidth();
+			height = outputProfile.getMaxHeight();
+		}
+
 		boolean convertColors =
 			bufferedImage.getType() == BufferedImageType.TYPE_CUSTOM.getTypeId() ||
 			bufferedImage.getColorModel().getColorSpace().getType() != ColorSpaceType.TYPE_RGB.getTypeId();
 
 		// Impose DLNA format restrictions
-		if (
-			outputFormat == inputResult.imageFormat &&
-			(
-				dlnaCompliant ||
-				dlnaThumbnail ||
-				outputProfile != null
-			)
-		) {
+		if (!reencode && outputFormat == inputResult.imageFormat && outputProfile != null) {
 			DLNAComplianceResult complianceResult;
 			switch (outputFormat) {
 				case GIF:
 				case JPEG:
 				case PNG:
-					ImageInfo imageInfo = new ImageInfo(
+					ImageInfo imageInfo;
+					// metadata is only null at this stage if inputImage != null and no rotation was necessary
+					if (metadata == null) {
+						imageInfo = inputImage.getImageInfo();
+					}
+					imageInfo = ImageInfo.create(
 						bufferedImage.getWidth(),
 						bufferedImage.getHeight(),
 						inputResult.imageFormat,
@@ -1359,17 +1299,12 @@ public class ImagesUtil {
 						false,
 						true
 					);
-					if (outputProfile != null) {
-						complianceResult = DLNAImageProfile.checkCompliance(imageInfo, outputProfile);
-					} else {
-						complianceResult = DLNAImageProfile.checkCompliance(imageInfo, outputFormat);
-					}
+					complianceResult = DLNAImageProfile.checkCompliance(imageInfo, outputProfile);
 					break;
 				default:
 					throw new IllegalStateException("Unexpected image format: " + outputFormat);
 			}
-			convertColors |= !complianceResult.isColorsCorrect();
-			reencode = convertColors || !complianceResult.isFormatCorrect();
+			reencode = reencode || convertColors || !complianceResult.isFormatCorrect() || !complianceResult.isColorsCorrect();;
 			if (!complianceResult.isResolutionCorrect()) {
 				width = width > 0 && complianceResult.getMaxWidth() > 0 ?
 					Math.min(width, complianceResult.getMaxWidth()) :
@@ -1401,8 +1336,8 @@ public class ImagesUtil {
 			bufferedImage = convertedImage;
 		}
 
-		if (width == 0 ||
-			height == 0 ||
+		if (width < 1 ||
+			height < 1 ||
 			(
 				ScaleType.MAX.equals(scaleType) &&
 				bufferedImage.getWidth() <= width &&
@@ -1410,21 +1345,29 @@ public class ImagesUtil {
 			)
 		) {
 			//No resize, just convert
-			if (!reencode && inputResult.imageFormat.equals(outputFormat)) {
+			if (!reencode && inputResult.imageFormat == outputFormat) {
 				// Nothing to do, just return source
+
+				// metadata is only null at this stage if inputImage != null
 				Image result;
 				if (dlnaThumbnail) {
-					result = new DLNAThumbnail(inputByteArray, outputFormat, bufferedImage, metadata, outputProfile, false);
+					result = metadata == null ?
+						new DLNAThumbnail(inputImage, outputProfile, false) :
+						new DLNAThumbnail(inputByteArray, outputFormat, bufferedImage, metadata, outputProfile, false);
 				} else if (dlnaCompliant) {
-					result = new DLNAImage(inputByteArray, outputFormat, bufferedImage, metadata, outputProfile, false);
+					result = metadata == null ?
+						new DLNAImage(inputImage, outputProfile, false) :
+						new DLNAImage(inputByteArray, outputFormat, bufferedImage, metadata, outputProfile, false);
 				} else {
-					result = new Image(inputByteArray, outputFormat, bufferedImage, metadata, false);
+					result = metadata == null ?
+						new Image(inputImage, false) :
+						new Image(inputByteArray, outputFormat, bufferedImage, metadata, false);
 				}
 				bufferedImage.flush();
 				return result;
 			}
 		} else {
-			boolean force = outputProfile != null && DLNAImageProfile.JPEG_RES_H_V.equals(outputProfile);
+			boolean force = DLNAImageProfile.JPEG_RES_H_V.equals(outputProfile);
 			BufferedImage oldBufferedImage = bufferedImage;
 			if (padToSize && force) {
 				bufferedImage = Thumbnails.of(bufferedImage)
@@ -1456,25 +1399,14 @@ public class ImagesUtil {
 			.toOutputStream(outputStream);
 
 		byte[] outputByteArray = outputStream.toByteArray();
-		if (updateMetadata) {
-			try {
-				metadata = getMetadata(outputByteArray, outputFormat);
-			} catch (IOException | ImageProcessingException e) {
-				LOGGER.error("Failed to read output image metadata: {}", e.getMessage());
-				LOGGER.trace("", e);
-				metadata = new Metadata();
-			}
-		} else {
-			metadata = null;
-		}
 
 		Image result;
 		if (dlnaThumbnail) {
-			result = new DLNAThumbnail(outputByteArray, outputFormat, bufferedImage, metadata, outputProfile, false);
+			result = new DLNAThumbnail(outputByteArray, bufferedImage.getWidth(), bufferedImage.getHeight(), outputFormat, null, null, outputProfile, false);
 		} else if (dlnaCompliant) {
-			result = new DLNAImage(outputByteArray, outputFormat, bufferedImage, metadata, outputProfile, false);
+			result = new DLNAImage(outputByteArray, bufferedImage.getWidth(), bufferedImage.getHeight(), outputFormat, null, null, outputProfile, false);
 		} else {
-			result = new Image(outputByteArray, outputFormat, bufferedImage, metadata, false);
+			result = new Image(outputByteArray, bufferedImage.getWidth(), bufferedImage.getHeight(), outputFormat, null, null, true, false);
 		}
 		bufferedImage.flush();
 		return result;
@@ -1494,26 +1426,9 @@ public class ImagesUtil {
 			return null;
 		}
 
-		// First check if there are any ExifThumbnailDirectory
+		// First check if there is a ExifThumbnailDirectory
 		Collection<ExifThumbnailDirectory> directories = metadata.getDirectoriesOfType(ExifThumbnailDirectory.class);
 		if (directories.isEmpty()) {
-			return null;
-		}
-
-		// The Metadata instance we have didn't store the thumbnail data, read them again
-		metadata = new Metadata();
-		try {
-	        RandomAccessFile randomAccessFile = new RandomAccessFile(file, "r");
-
-	        try {
-	            ExifTiffHandler handler = new ExifTiffHandler(metadata, true, null);
-	            new TiffReader().processTiff(new RandomAccessFileReader(randomAccessFile), handler, 0);
-	        } finally {
-	            randomAccessFile.close();
-	        }
-		} catch (IOException | TiffProcessingException e) {
-			LOGGER.debug("Error while reading \"{}\" metadata: {}", file.getAbsolutePath(), e.getMessage());
-			LOGGER.trace("", e);
 			return null;
 		}
 
@@ -1631,13 +1546,25 @@ public class ImagesUtil {
 		            metadata = BmpMetadataReader.readMetadata(inputStream);
 					break;
 				case Gif:
-		            metadata = GifMetadataReader.readMetadata(inputStream);
+		            //metadata = GifMetadataReader.readMetadata(inputStream);
+					// XXX Can be removed when the next release of metadata-extractor is available
+			        metadata = new Metadata();
+			        new GifReader().extract(new StreamReader(inputStream), metadata);
 					break;
 				case Ico:
 		            metadata = IcoMetadataReader.readMetadata(inputStream);
 					break;
 				case Jpeg:
-		            metadata = JpegMetadataReader.readMetadata(inputStream);
+		            //metadata = JpegMetadataReader.readMetadata(inputStream);
+					// XXX Can be removed when the next release of metadata-extractor is available
+			        metadata = new Metadata();
+			        Iterable<JpegSegmentMetadataReader> readers = Arrays.asList(
+			            new JpegReader(),
+			            new JfifReader(),
+			            new ExifReader(),
+			            new JpegDHTReader()
+			        );
+			        JpegMetadataReader.process(metadata, inputStream, readers);
 					break;
 				case Pcx:
 		            metadata = PcxMetadataReader.readMetadata(inputStream);
@@ -1664,10 +1591,10 @@ public class ImagesUtil {
 						inputStream, RandomAccessStreamReader.DEFAULT_CHUNK_LENGTH, -1
 					));
 					break;
-				// Return an empty Metadata instance for unsupported formats
 				case Crw:
 				case Unknown:
 				default:
+					// Return an empty Metadata instance for unsupported formats
 					metadata = new Metadata();
 			}
 		} else {
@@ -1676,13 +1603,24 @@ public class ImagesUtil {
 					metadata = BmpMetadataReader.readMetadata(inputStream);
 					break;
 				case GIF:
-					metadata = GifMetadataReader.readMetadata(inputStream);
+		            //metadata = GifMetadataReader.readMetadata(inputStream);
+					// XXX Can be removed when the next release of metadata-extractor is available
+			        metadata = new Metadata();
+			        new GifReader().extract(new StreamReader(inputStream), metadata);
 					break;
 				case ICO:
 					metadata = IcoMetadataReader.readMetadata(inputStream);
 					break;
 				case JPEG:
-					metadata = JpegMetadataReader.readMetadata(inputStream);
+					//metadata = JpegMetadataReader.readMetadata(inputStream);
+			        metadata = new Metadata();
+			        Iterable<JpegSegmentMetadataReader> readers = Arrays.asList(
+			            new JpegReader(),
+			            new JfifReader(),
+			            new ExifReader(),
+			            new JpegDHTReader()
+			        );
+			        JpegMetadataReader.process(metadata, inputStream, readers);
 					break;
 				case DCX:
 				case PCX:
@@ -1779,6 +1717,134 @@ public class ImagesUtil {
 		} catch (RuntimeException e) {
 			throw new IOUtilsRuntimeException(e.getMessage(), e);
 		}
+	}
+
+	/**
+	 * Retrieves the bit depth from an array of bit depths for all components.
+	 * The last component's bit depth is allowed to be different from the rest,
+	 * but the others must be equal or an {@link InvalidStateException} is
+	 * thrown.
+	 *
+	 * @param bitDepthArray the array of bit depths for all components.
+	 * @return The bit depth value if it's constant for all but the last
+	 *         component.
+	 * @throws InvalidStateException If the bit depth values vary or
+	 *             {@code bitDepthArray} is null or empty.
+	 */
+	public static int getBitDepthFromArray(int[] bitDepthArray) throws InvalidStateException {
+		if (bitDepthArray == null || bitDepthArray.length == 0) {
+			throw new InvalidStateException("The bit depth array cannot be null or empty");
+		}
+
+		try {
+			return getConstantIntArrayValue(bitDepthArray);
+		} catch (InvalidStateException e) {
+			// Allow the last value to be different in it's the alpha
+			if (bitDepthArray.length > 1) {
+				int[] tmpArray = new int[bitDepthArray.length - 1];
+				System.arraycopy(bitDepthArray, 0, tmpArray, 0, bitDepthArray.length - 1);
+				return getConstantIntArrayValue(tmpArray);
+			} else {
+				throw e;
+			}
+		}
+	}
+
+	/**
+	 * Retrieves the bit depth from an array of bit depths for all components.
+	 * The last component's bit depth is allowed to be different from the rest,
+	 * but the others must be equal or an {@link InvalidStateException} is
+	 * thrown.
+	 *
+	 * @param bitDepthArray the array of bit depths for all components.
+	 * @return The bit depth value if it's constant for all but the last
+	 *         component.
+	 * @throws InvalidStateException If the bit depth values vary or
+	 *             {@code bitDepthArray} is null or empty.
+	 */
+	public static byte getBitDepthFromArray(byte[] bitDepthArray) throws InvalidStateException {
+		if (bitDepthArray == null || bitDepthArray.length == 0) {
+			throw new InvalidStateException("The bit depth array cannot be null or empty");
+		}
+
+		try {
+			return getConstantByteArrayValue(bitDepthArray);
+		} catch (InvalidStateException e) {
+			// Allow the last value to be different in it's the alpha
+			if (bitDepthArray.length > 1) {
+				byte[] tmpArray = new byte[bitDepthArray.length - 1];
+				System.arraycopy(bitDepthArray, 0, tmpArray, 0, bitDepthArray.length - 1);
+				return getConstantByteArrayValue(tmpArray);
+			} else {
+				throw e;
+			}
+		}
+	}
+
+	/**
+	 * Verifies and retrieves a constant integer value from an integer array. If
+	 * the {@code intArray}'s values aren't all the same or {@code intArray} is
+	 * {@code null} or empty, an {@link InvalidStateException} is thrown.
+	 *
+	 * @param intArray the integer array from which to extract the constant
+	 *            integer value.
+	 * @return The constant integer value.
+	 * @throws InvalidStateException if the values aren't equal or the array is
+	 *             {@code null} or empty.
+	 */
+	public static int getConstantIntArrayValue(int[] intArray) throws InvalidStateException {
+		if (intArray == null || intArray.length == 0) {
+			throw new InvalidStateException("The array cannot be null or empty");
+		}
+
+		if (intArray.length == 1) {
+			return intArray[0];
+		}
+
+		Integer result = null;
+		for (int i : intArray) {
+			if (result == null) {
+				result = Integer.valueOf(i);
+			} else {
+				if (result.intValue() != i) {
+					throw new InvalidStateException("The array doesn't have a constant value: " + Arrays.toString(intArray));
+				}
+			}
+		}
+		return result.intValue();
+	}
+
+	/**
+	 * Verifies and retrieves a constant byte value from a byte array. If
+	 * the {@code byteArray}'s values aren't all the same or {@code byteArray} is
+	 * {@code null} or empty, an {@link InvalidStateException} is thrown.
+	 *
+	 * @param byteArray the byte array from which to extract the constant
+	 *            byte value.
+	 * @return The constant byte value.
+	 * @throws InvalidStateException if the values aren't equal or the array is
+	 *             {@code null} or empty.
+	 */
+	public static byte getConstantByteArrayValue(byte[] byteArray) throws InvalidStateException {
+		if (byteArray == null || byteArray.length == 0) {
+			throw new InvalidStateException("The array cannot be null or empty");
+		}
+
+		if (byteArray.length == 1) {
+			return byteArray[0];
+		}
+
+		Byte result = null;
+		for (byte b : byteArray) {
+			if (result == null) {
+				result = Byte.valueOf(b);
+			} else {
+				if (result.byteValue() != b) {
+					throw new InvalidStateException("The array doesn't have a constant value: " + Arrays.toString(byteArray));
+				}
+			}
+		}
+		return result.byteValue();
 	}
 
 	/**

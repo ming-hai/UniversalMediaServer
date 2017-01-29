@@ -21,7 +21,8 @@ package net.pms.dlna;
 
 import java.util.Comparator;
 import net.pms.dlna.DLNAImageProfile.HypotheticalResult;
-import net.pms.formats.ImageFormat;
+import net.pms.image.ImageFormat;
+import net.pms.image.ImageInfo;
 
 /**
  * This class is used to represent a {@code <res>} element representing an
