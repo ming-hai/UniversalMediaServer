@@ -231,6 +231,7 @@ public class FormatFactoryTest {
 		testSingleFormat("test.3g2a", "THREEG2A", Format.AUDIO);
 		testSingleFormat("test.3ga", "THREEGA", Format.AUDIO);
 		testSingleFormat("test.amr", "THREEGA", Format.AUDIO);
+		testSingleFormat("test.awb", "THREEGA", Format.AUDIO);
 		testSingleFormat("test.3gpa", "THREEGA", Format.AUDIO);
 		testSingleFormat("test.tta", "TTA", Format.AUDIO);
 		testSingleFormat("test.txt", "TXT", Format.SUBTITLE);
