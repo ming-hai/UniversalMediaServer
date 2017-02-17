@@ -464,8 +464,8 @@ public class LibMediaInfoParser {
 			format = FormatConfiguration.AIFF;
 		} else if (value.startsWith("atmos") || value.equals("131")) {
 			format = FormatConfiguration.ATMOS;
-		} else if (value.startsWith("cinepack")) {
-			format = FormatConfiguration.CINEPACK;
+		} else if (value.startsWith("cinepak")) {
+			format = FormatConfiguration.CINEPAK;
 		} else if (value.equals("opus")) {
 			format = FormatConfiguration.OPUS;
 		} else if (value.contains("realmedia") || value.startsWith("rv")) {
