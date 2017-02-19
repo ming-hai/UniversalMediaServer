@@ -522,4 +522,26 @@ public abstract class ExifInfo extends ImageInfo {
 		ExifColorSpace exifColorSpace;
 		Boolean hasExifThumbnail;
 	}
+
+	@Override
+	protected void buildToString(StringBuilder sb) {
+		if (photometricInterpretation != null) {
+			sb.append(", Photometric Interpretation = ").append(photometricInterpretation);
+		}
+		if (exifOrientation != null) {
+			sb.append(", Exif Orientation = ").append(exifOrientation);
+		}
+		if (exifVersion != null) {
+			sb.append(", Exif Version = ").append(exifVersion);
+		}
+		if (exifCompression != null) {
+			sb.append(", Exif Compression = ").append(exifCompression);
+		}
+		if (exifColorSpace != null) {
+			sb.append(", Exif Color Space = ").append(exifColorSpace);
+		}
+		if (hasExifThumbnail != null) {
+			sb.append(", Has Exif Thumbnail = ").append(hasExifThumbnail.booleanValue() ? "True" : "False");
+		}
+	}
 }
